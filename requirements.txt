@@ -6,3 +6,4 @@ PyYAML
 pytest
 alembic
 python-dotenv
+requests
