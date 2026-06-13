@@ -1,0 +1,7 @@
+{
+  "models": [
+    {"id": "claude-3-5-sonnet-20241022", "provider": "anthropic", "display": "Claude 3.5 Sonnet"},
+    {"id": "gpt-4o", "provider": "openai", "display": "GPT-4o"}
+  ],
+  "availableModels": ["claude-3-5-sonnet-20241022", "gpt-4o"]
+}

@@ -1,0 +1,9 @@
+name: task-triage
+description: "任务分类示例"
+steps:
+  - id: list_inbox
+    type: code
+    description: "读取收件箱任务"
+  - id: categorize
+    type: agent
+    description: "用LLM分类并建议动作"
