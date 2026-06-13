@@ -1,32 +1,35 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from pathlib import Path
-import json
+from typing import Dict, Any
 from src.api.middleware.auth import require_api_token
+from src.enterprise import control_panel
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_api_token)])
-CLIENTS_FILE = Path(__file__).parents[3] / "config" / "clients.json"
-CLIENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-if not CLIENTS_FILE.exists():
-    CLIENTS_FILE.write_text(json.dumps({"clients": []}, indent=2))
 
 class RegisterClientIn(BaseModel):
     client_id: str
     name: str
-    metadata: dict = {}
+    metadata: Dict[str, Any] = {}
 
 @router.post("/clients/register")
 def register_client(payload: RegisterClientIn):
-    data = json.loads(CLIENTS_FILE.read_text())
-    for c in data["clients"]:
-        if c["client_id"] == payload.client_id:
-            raise HTTPException(status_code=409, detail="client exists")
-    entry = {"client_id": payload.client_id, "name": payload.name, "metadata": payload.metadata}
-    data["clients"].append(entry)
-    CLIENTS_FILE.write_text(json.dumps(data, indent=2))
-    return {"status":"registered","client":entry}
+    c = control_panel.register_client(payload.client_id, payload.name, payload.metadata)
+    return {"status": "registered", "client_id": c.client_id, "name": c.name}
 
 @router.get("/clients")
 def list_clients():
-    data = json.loads(CLIENTS_FILE.read_text())
-    return {"clients": data["clients"]}
+    clients = control_panel.list_clients()
+    result = [{"client_id": c.client_id, "name": c.name, "metadata": c.metadata} for c in clients]
+    return {"clients": result}
+
+class DistributeModelIn(BaseModel):
+    client_id: str
+    model_id: str
+    policy: Dict[str, Any] = {}
+
+@router.post("/clients/distribute-model")
+def distribute_model(payload: DistributeModelIn):
+    cm = control_panel.assign_model_to_client(payload.client_id, payload.model_id, payload.policy)
+    if cm is None:
+        raise HTTPException(status_code=404, detail="client not found")
+    return {"status": "ok", "model_assignment_id": cm.id}

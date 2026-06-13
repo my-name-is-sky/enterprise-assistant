@@ -26,4 +26,4 @@ def publish_skill(payload: PublishSkillIn):
         raise HTTPException(status_code=400, detail="invalid filename")
     path = SKILLS_DIR / payload.filename
     path.write_text(payload.content, encoding='utf-8')
-    return {"status":"published", "path": str(path)}
+    return {"status": "published", "path": str(path)}
