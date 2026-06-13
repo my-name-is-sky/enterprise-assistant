@@ -1,0 +1,443 @@
+name: Implement Enterprise Features
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/enterprise-features
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Create feature files and commit
+        run: |
+          set -euo pipefail
+          echo "Generating enterprise feature files..."
+
+          mkdir -p src/api/src_routes src/api/routes src/api/middleware src/enterprise src
+          mkdir -p skills/examples config docker k8s logs tests
+
+          # API app
+          cat > src/api/app.py <<'PY'
+          from fastapi import FastAPI
+          from src.api.middleware import audit
+          from src.api.routes import admin, skills, workflows
+
+          app = FastAPI(title="Enterprise Assistant API")
+
+          # Register routers
+          app.include_router(admin.router)
+          app.include_router(skills.router)
+          app.include_router(workflows.router)
+
+          # Register audit middleware
+          app.middleware("http")(audit.audit_middleware)
+
+          @app.get("/health")
+          async def health():
+              return {"status": "ok"}
+          PY
+
+          # DB layer (SQLAlchemy)
+          cat > src/db.py <<'PY'
+          from sqlalchemy import create_engine
+          from sqlalchemy.orm import sessionmaker, declarative_base
+          import os
+
+          DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+
+          engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+          SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+          Base = declarative_base()
+
+          def init_db():
+              Base.metadata.create_all(bind=engine)
+          PY
+
+          # Models: clients and model assignments
+          cat > src/enterprise/models.py <<'PY'
+          from sqlalchemy import Column, Integer, String, JSON, ForeignKey
+          from sqlalchemy.orm import relationship
+          from src.db import Base
+
+          class Client(Base):
+              __tablename__ = "clients"
+              id = Column(Integer, primary_key=True, index=True)
+              client_id = Column(String, unique=True, index=True, nullable=False)
+              name = Column(String, nullable=False)
+              metadata = Column(JSON, nullable=True)
+              models = relationship("ClientModel", back_populates="client")
+
+          class ClientModel(Base):
+              __tablename__ = "client_models"
+              id = Column(Integer, primary_key=True, index=True)
+              client_id_fk = Column(Integer, ForeignKey("clients.id"), nullable=False)
+              model_id = Column(String, nullable=False)
+              policy = Column(JSON, nullable=True)
+              client = relationship("Client", back_populates="models")
+          PY
+
+          # Enterprise control panel using DB
+          cat > src/enterprise/control_panel.py <<'PY'
+          from src.db import SessionLocal, init_db
+          from src.enterprise.models import Client, ClientModel
+          from sqlalchemy.exc import IntegrityError
+
+          # Initialize DB tables
+          init_db()
+
+          def register_client(client_id: str, name: str, metadata: dict):
+              db = SessionLocal()
+              try:
+                  c = Client(client_id=client_id, name=name, metadata=metadata)
+                  db.add(c)
+                  db.commit()
+                  db.refresh(c)
+                  return c
+              except IntegrityError:
+                  db.rollback()
+                  c = db.query(Client).filter(Client.client_id == client_id).first()
+                  return c
+              finally:
+                  db.close()
+
+          def list_clients():
+              db = SessionLocal()
+              try:
+                  return db.query(Client).all()
+              finally:
+                  db.close()
+
+          def assign_model_to_client(client_id: str, model_id: str, policy: dict):
+              db = SessionLocal()
+              try:
+                  client = db.query(Client).filter(Client.client_id == client_id).first()
+                  if not client:
+                      return None
+                  cm = ClientModel(client_id_fk=client.id, model_id=model_id, policy=policy)
+                  db.add(cm)
+                  db.commit()
+                  db.refresh(cm)
+                  return cm
+              finally:
+                  db.close()
+          PY
+
+          # LLM manager (Anthropic/OpenAI sample)
+          cat > src/enterprise/llm_manager.py <<'PY'
+          import os
+          import json
+          from typing import Optional
+          from pathlib import Path
+
+          DEFAULT_MODELS = Path(__file__).parents[1] / ".." / "config" / "models.json.example"
+
+          class LLMManager:
+              def __init__(self, config_path: Optional[Path]=None):
+                  self.config_path = config_path or DEFAULT_MODELS
+                  self._models = self._load()
+                  self.provider = os.getenv("LLM_PROVIDER", "anthropic")
+
+              def _load(self):
+                  try:
+                      with open(self.config_path, 'r', encoding='utf-8') as f:
+                          return json.load(f)
+                  except Exception:
+                      return {"models": [], "availableModels": []}
+
+              def list_models(self):
+                  return self._models.get("models", [])
+
+              def test_connection(self):
+                  # Demo: check API key presence
+                  key = os.getenv("LLM_API_KEY", "")
+                  return {"provider": self.provider, "key_present": bool(key), "models_count": len(self.list_models())}
+
+              def generate(self, model_id: str, prompt: str):
+                  # Example lightweight wrapper; real implementation uses provider SDKs
+                  if self.provider == "anthropic":
+                      key = os.getenv("LLM_API_KEY")
+                      if not key:
+                          raise RuntimeError("Missing LLM_API_KEY")
+                      # Placeholder: return prompt echo
+                      return {"model_id": model_id, "output": f"[Anthropic mock] {prompt}"}
+                  elif self.provider == "openai":
+                      key = os.getenv("LLM_API_KEY")
+                      if not key:
+                          raise RuntimeError("Missing LLM_API_KEY")
+                      return {"model_id": model_id, "output": f"[OpenAI mock] {prompt}"}
+                  else:
+                      return {"model_id": model_id, "output": f"[Local mock] {prompt}"}
+          PY
+
+          # Admin routes using DB-backed control panel
+          cat > src/api/routes/admin.py <<'PY'
+          from fastapi import APIRouter, Depends, HTTPException
+          from pydantic import BaseModel
+          from typing import Dict, Any
+          from src.api.middleware.auth import require_api_token
+          from src.enterprise import control_panel
+
+          router = APIRouter(prefix="/admin", dependencies=[Depends(require_api_token)])
+
+          class RegisterClientIn(BaseModel):
+              client_id: str
+              name: str
+              metadata: Dict[str, Any] = {}
+
+          @router.post("/clients/register")
+          def register_client(payload: RegisterClientIn):
+              c = control_panel.register_client(payload.client_id, payload.name, payload.metadata)
+              return {"status": "registered", "client_id": c.client_id, "name": c.name}
+
+          @router.get("/clients")
+          def list_clients():
+              clients = control_panel.list_clients()
+              result = [{"client_id": c.client_id, "name": c.name, "metadata": c.metadata} for c in clients]
+              return {"clients": result}
+
+          class DistributeModelIn(BaseModel):
+              client_id: str
+              model_id: str
+              policy: Dict[str, Any] = {}
+
+          @router.post("/clients/distribute-model")
+          def distribute_model(payload: DistributeModelIn):
+              cm = control_panel.assign_model_to_client(payload.client_id, payload.model_id, payload.policy)
+              if cm is None:
+                  raise HTTPException(status_code=404, detail="client not found")
+              return {"status": "ok", "model_assignment_id": cm.id}
+          PY
+
+          # Skills routes
+          cat > src/api/routes/skills.py <<'PY'
+          from fastapi import APIRouter, Depends, HTTPException
+          from pydantic import BaseModel
+          from pathlib import Path
+          import yaml
+          from src.api.middleware.auth import require_api_token
+
+          router = APIRouter(prefix="/skills", dependencies=[Depends(require_api_token)])
+          SKILLS_DIR = Path(__file__).parents[3] / "skills" / "examples"
+          SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
+          @router.get("/")
+          def list_skills():
+              skills = []
+              for p in SKILLS_DIR.glob("*.yaml"):
+                  with open(p, 'r', encoding='utf-8') as f:
+                      skills.append(yaml.safe_load(f))
+              return {"skills": skills}
+
+          class PublishSkillIn(BaseModel):
+              filename: str
+              content: str
+
+          @router.post("/publish")
+          def publish_skill(payload: PublishSkillIn):
+              if ".." in payload.filename or "/" in payload.filename:
+                  raise HTTPException(status_code=400, detail="invalid filename")
+              path = SKILLS_DIR / payload.filename
+              path.write_text(payload.content, encoding='utf-8')
+              return {"status": "published", "path": str(path)}
+          PY
+
+          # Workflows route
+          cat > src/api/routes/workflows.py <<'PY'
+          from fastapi import APIRouter, Depends
+          from pydantic import BaseModel
+          from src.api.middleware.auth import require_api_token
+
+          router = APIRouter(prefix="/workflows", dependencies=[Depends(require_api_token)])
+
+          class RunWorkflowIn(BaseModel):
+              workflow_id: str
+              params: dict = {}
+
+          @router.post("/run")
+          def run_workflow(payload: RunWorkflowIn):
+              # TODO: enqueue to background worker
+              return {"status": "started", "workflow_id": payload.workflow_id}
+          PY
+
+          # Auth middleware
+          cat > src/api/middleware/auth.py <<'PY'
+          import os
+          from typing import Optional
+          from fastapi import Header, HTTPException
+
+          API_TOKEN = os.getenv("EA_API_TOKEN", "devtoken")
+
+          async def require_api_token(x_api_token: Optional[str] = Header(None)):
+              if x_api_token is None:
+                  raise HTTPException(status_code=401, detail="Missing X-API-TOKEN header")
+              if x_api_token != API_TOKEN:
+                  raise HTTPException(status_code=403, detail="Invalid token")
+              return True
+          PY
+
+          # Audit middleware
+          cat > src/api/middleware/audit.py <<'PY'
+          from fastapi import Request
+          import time
+          from pathlib import Path
+          import json
+
+          AUDIT_LOG = Path(__file__).parents[4] / "logs" / "audit.log"
+          AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+          async def audit_middleware(request: Request, call_next):
+              start = time.time()
+              resp = await call_next(request)
+              end = time.time()
+              entry = {
+                  "path": str(request.url.path),
+                  "method": request.method,
+                  "status_code": resp.status_code,
+                  "duration_ms": int((end - start)*1000)
+              }
+              with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+                  f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+              return resp
+          PY
+
+          # Example skills
+          cat > skills/examples/client_management.yaml <<'YML'
+          name: client-management
+          description: "客户管理示例"
+          steps:
+            - id: collect
+              type: code
+              description: "收集客户数据"
+            - id: analyze
+              type: agent
+              description: "用LLM分析"
+          YML
+
+          cat > skills/examples/morning_routine.yaml <<'YML'
+          name: morning-routine
+          description: "早晨例程"
+          steps:
+            - id: gather
+              type: code
+              description: "收集上下文"
+            - id: plan
+              type: agent
+              description: "生成日计划"
+          YML
+
+          cat > skills/examples/task_triage.yaml <<'YML'
+          name: task-triage
+          description: "任务分类示例"
+          steps:
+            - id: list_inbox
+              type: code
+              description: "读取收件箱任务"
+            - id: categorize
+              type: agent
+              description: "用LLM分类并建议动作"
+          YML
+
+          # Docker compose with Postgres
+          cat > docker/docker-compose.yml <<'YML'
+          version: '3.8'
+          services:
+            api:
+              build: .
+              command: uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
+              volumes:
+                - ./:/workspace
+              working_dir: /workspace
+              ports:
+                - "8000:8000"
+              environment:
+                - DATABASE_URL=postgresql://postgres:postgres@db:5432/ea
+                - EA_API_TOKEN=devtoken
+            db:
+              image: postgres:15
+              environment:
+                POSTGRES_USER: postgres
+                POSTGRES_PASSWORD: postgres
+                POSTGRES_DB: ea
+              ports:
+                - "5432:5432"
+          YML
+
+          # K8s simple deployment
+          cat > k8s/deployment.yaml <<'YML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: enterprise-assistant
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: enterprise-assistant
+            template:
+              metadata:
+                labels:
+                  app: enterprise-assistant
+              spec:
+                containers:
+                  - name: api
+                    image: enterprise-assistant:latest
+                    ports:
+                      - containerPort: 8000
+                    env:
+                      - name: EA_API_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: ea-secrets
+                            key: api-token
+          YML
+
+          # requirements
+          cat > requirements.txt <<'TXT'
+          fastapi>=0.110.0
+          uvicorn[standard]>=0.29.0
+          sqlalchemy>=2.0.0
+          pydantic>=2.0.0
+          pyyaml>=6.0
+          psycopg2-binary>=2.9.9
+          alembic>=1.13.0
+          TXT
+
+          # __init__ files
+          touch src/__init__.py src/api/__init__.py src/api/routes/__init__.py src/api/middleware/__init__.py src/enterprise/__init__.py
+
+          # .env.example
+          cat > .env.example <<'ENV'
+          DATABASE_URL=sqlite:///./dev.db
+          EA_API_TOKEN=devtoken
+          LLM_PROVIDER=anthropic
+          LLM_API_KEY=your_key_here
+          ENV
+
+          # config/models.json.example
+          cat > config/models.json.example <<'JSON'
+          {
+            "models": [
+              {"id": "claude-3-5-sonnet-20241022", "provider": "anthropic", "display": "Claude 3.5 Sonnet"},
+              {"id": "gpt-4o", "provider": "openai", "display": "GPT-4o"}
+            ],
+            "availableModels": ["claude-3-5-sonnet-20241022", "gpt-4o"]
+          }
+          JSON
+
+          git config user.email "github-actions@github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git commit -m "feat: scaffold enterprise features (API, DB, skills, docker, k8s)"
+          git push origin feature/enterprise-features
