@@ -1,0 +1,9 @@
+name: morning-routine
+description: "早晨例程"
+steps:
+  - id: gather
+    type: code
+    description: "收集上下文"
+  - id: plan
+    type: agent
+    description: "生成日计划"

@@ -1,0 +1,9 @@
+llm:
+  provider: "anthropic"
+  api_key: "REPLACE_ME"
+  default_model: "claude-2"
+
+enterprise:
+  org_name: "ACME Corp"
+  admin_contact: "admin@acme.example"
+  audit_enabled: true

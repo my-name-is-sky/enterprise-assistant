@@ -1,0 +1,9 @@
+name: client-management
+description: "客户管理示例"
+steps:
+  - id: collect
+    type: code
+    description: "收集客户数据"
+  - id: analyze
+    type: agent
+    description: "用LLM分析"
